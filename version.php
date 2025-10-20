@@ -25,8 +25,8 @@
 
 defined('MOODLE_INTERNAL') || die('Direct access to this script is forbidden.');
 
-$plugin->version   = 2025052900; // The current module version (Date: YYYYMMDDXX).
+$plugin->version   = 2025102000; // The current module version (Date: YYYYMMDDXX).
 $plugin->requires  = 2023042400; // Requires this Moodle version (4.2).
 $plugin->maturity = MATURITY_STABLE; // This version's maturity level.
-$plugin->release = '1.0'; // Human-readable version name.
+$plugin->release = '2.0'; // Human-readable version name.
 $plugin->component = 'customcertelement_textreplace';

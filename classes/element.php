@@ -61,12 +61,32 @@ class element extends \mod_customcert\element
     {
         return $data->text;
     }
-
     /**
      * 
      * Function to replace variables in the text with user data.
      * 
      */
+
+    protected function get_user_field_value(\stdClass $user, $field): string
+    {
+        global $CFG, $DB;
+        $valeu = '';
+
+        if ($field = $DB->get_record('user_info_field', ['shortname' => $field])) {
+            // Found the field name, let's update the value to display.
+            $value = $field->name;
+            $file = $CFG->dirroot . '/user/profile/field/' . $field->datatype . '/field.class.php';
+            if (file_exists($file)) {
+                require_once($CFG->dirroot . '/user/profile/lib.php');
+                require_once($file);
+                $class = "profile_field_{$field->datatype}";
+                $field = new $class($field->id, $user->id);
+                $value = $field->display_data();
+            }
+        }
+        $context = \mod_customcert\element_helper::get_context($this->get_id());
+        return format_string($value, true, ['context' => $context]);
+    }
 
     function get_customcoursefield_value(array $customfields, string $shortname)
     {
@@ -79,20 +99,36 @@ class element extends \mod_customcert\element
         return null;
     }
 
-    public function replace_text($text, $user, $context = [])
+    public function replace_text($texto, $user, $context = [])
     {
         $replacer = function ($matches) use ($context, $user) {
             list($full, $table, $field, $fallback) = $matches + [null, null, null, ''];
             $value = '';
 
-            //Recovery courseid
+            // Recupera o courseid e dados do curso.
             $courseid = \mod_customcert\element_helper::get_courseid($this->id);
             $course = get_course($courseid);
             $customcourse = new \core_course_list_element($course);
             $customcourse = $customcourse->get_custom_fields();
-              switch ($table) {
+
+            // Apenas para depuração — REMOVA depois.
+            // error_log("Table: $table | Field: $field");
+
+            switch ($table) {
                 case 'user':
-                    $value = $user->$field ?? ($user->profile[$field] ?? '');
+                    // Gera array com os campos customizados de perfil do usuário baseando no $user->id e retorna um array $user->profile
+                    if (!empty($user->id)) {
+                        global $CFG;
+                        if (!function_exists('profile_load_data')) {
+                            require_once($CFG->dirroot . '/user/profile/lib.php');
+                        }
+                        // profile_load_data aceita o usuário por referência e popula $user->profile
+                        profile_load_data($user);
+                    }
+
+                    $value = $user->$field ?? ($this->get_user_field_value($user, $field) ?? '');
+
+
                     break;
 
                 case 'course':
@@ -100,7 +136,8 @@ class element extends \mod_customcert\element
                     break;
 
                 default:
-                     if (isset($context[$table]) && is_object($context[$table])) {
+                    // Se o contexto tiver essa tabela, tenta pegar direto.
+                    if (isset($context[$table]) && is_object($context[$table])) {
                         $obj = $context[$table];
                         $value = $obj->$field ?? '';
                     }
@@ -109,9 +146,11 @@ class element extends \mod_customcert\element
 
             return ($value !== '') ? $value : $fallback;
         };
-          $pattern = '/\{([a-zA-Z0-9_]+):([a-zA-Z0-9_]+)(?:\|([^}]*))?\}/';
 
-        return preg_replace_callback($pattern, $replacer, $text);
+        // Regex: {tabela:campo|fallback}
+        $pattern = '/\{([a-zA-Z0-9_]+):([a-zA-Z0-9_]+)(?:\|([^}]*))?\}/';
+
+        return preg_replace_callback($pattern, $replacer, $texto);
     }
 
 
@@ -124,6 +163,7 @@ class element extends \mod_customcert\element
      */
     public function render($pdf, $preview, $user)
     {
+
         \mod_customcert\element_helper::render_content($pdf, $this, $this->replace_text($this->get_text(), $user));
     }
 
