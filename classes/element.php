@@ -20,6 +20,7 @@
  * @package    customcertelement_textreplace
  * @copyright  2013 Mark Nelson <markn@moodle.com>  
  * @author     2025 Vanderson Farias <vanderson2005@gmail.com>
+ * @modified   2026 Bruno Ribeiro Silva <ribeirosilva.bruno@gmail.com>
  * @license    http://www.gnu.org/copyleft/gpl.html GNU GPL v3 or later
  */
 
@@ -31,177 +32,287 @@ namespace customcertelement_textreplace;
  * @package    customcertelement_textreplace
  * @copyright  2013 Mark Nelson <markn@moodle.com>  
  * @author     2025 Vanderson Farias <vanderson2005@gmail.com>
+ * @modified   2026 Bruno Ribeiro Silva <ribeirosilva.bruno@gmail.com>
  * @license    http://www.gnu.org/copyleft/gpl.html GNU GPL v3 or later
  */
-class element extends \mod_customcert\element
-{
+defined('MOODLE_INTERNAL') || die();
 
-    /**
-     * This function renders the form elements when adding a customcert element.
-     *
-     * @param \MoodleQuickForm $mform the edit_form instance
-     */
-    public function render_form_elements($mform)
-    {
-        $mform->addElement('textarea', 'text', get_string('text', 'customcertelement_text'));
+/**
+ * Plugin Text Replace (Novas funções implementadas com novos campos)
+ * Busca data em: Matrículas -> Papéis -> Logs (Fallback triplo)
+ */
+class element extends \mod_customcert\element {
+
+    public function render_form_elements($mform) {
+        $mform->addElement('textarea', 'text', 'Texto do Certificado');
         $mform->setType('text', PARAM_RAW);
-        $mform->addHelpButton('text', 'text', 'customcertelement_text');
-
         parent::render_form_elements($mform);
     }
 
-    /**
-     * This will handle how form data will be saved into the data column in the
-     * customcert_elements table.
-     *
-     * @param \stdClass $data the form data
-     * @return string the text
-     */
-    public function save_unique_data($data)
-    {
-        return $data->text;
+    public function save_unique_data($data) {
+        return isset($data->text) ? $data->text : '';
     }
-    /**
-     * 
-     * Function to replace variables in the text with user data.
-     * 
-     */
 
-    protected function get_user_field_value(\stdClass $user, $field): string
-    {
-        global $CFG, $DB;
-        $valeu = '';
-
-        if ($field = $DB->get_record('user_info_field', ['shortname' => $field])) {
-            // Found the field name, let's update the value to display.
-            $value = $field->name;
-            $file = $CFG->dirroot . '/user/profile/field/' . $field->datatype . '/field.class.php';
-            if (file_exists($file)) {
-                require_once($CFG->dirroot . '/user/profile/lib.php');
-                require_once($file);
-                $class = "profile_field_{$field->datatype}";
-                $field = new $class($field->id, $user->id);
-                $value = $field->display_data();
+    protected function load_user_profile($user) {
+        global $CFG;
+        if (isset($user->profile)) return $user;
+        if (file_exists($CFG->dirroot . '/user/profile/lib.php')) {
+            require_once($CFG->dirroot . '/user/profile/lib.php');
+            if (function_exists('profile_load_data')) {
+                profile_load_data($user);
             }
         }
-        $context = \mod_customcert\element_helper::get_context($this->get_id());
-        return format_string($value, true, ['context' => $context]);
+        return $user;
     }
 
-    function get_customcoursefield_value(array $customfields, string $shortname)
-    {
-        foreach ($customfields as $data_controller) {
-            $field = $data_controller->get_field();
-            if ($field->get('shortname') === $shortname) {
-                return $data_controller->get_value();
+    protected function get_course_grade($courseid, $userid) {
+        global $CFG;
+        require_once($CFG->libdir . '/gradelib.php');
+        $grade = \grade_get_course_grade($userid, $courseid);
+        if ($grade && isset($grade->str_grade)) {
+            return $grade->str_grade;
+        }
+        return '';
+    }
+
+    protected function get_teachers($courseid) {
+        $context = \context_course::instance($courseid);
+        $teachers = get_role_users(3, $context, false, 'u.firstname, u.lastname'); 
+        if (!$teachers) {
+            $teachers = get_users_by_capability($context, 'moodle/course:update', 'u.firstname, u.lastname');
+        }
+        $names = [];
+        foreach ($teachers as $t) {
+            $names[] = fullname($t);
+        }
+        return implode(', ', $names);
+    }
+
+    /**
+     * NOVA LÓGICA DE DATA DE MATRÍCULA (Robustez para Admins)
+     */
+    protected function get_enrollment_date($courseid, $userid, $format) {
+        global $DB;
+        
+        // 1. TENTATIVA PADRÃO: Tabela de Matrículas (Alunos normais)
+        // Busca a data de início mais antiga (caso tenha mais de uma)
+        $sql = "SELECT ue.timestart FROM {user_enrolments} ue 
+                JOIN {enrol} e ON e.id = ue.enrolid 
+                WHERE e.courseid = :courseid AND ue.userid = :userid 
+                ORDER BY ue.timestart ASC";
+        // get_records com limit 1 é mais seguro que get_record para evitar erros de múltiplos resultados
+        $enrols = $DB->get_records_sql($sql, ['courseid' => $courseid, 'userid' => $userid], 0, 1);
+        
+        if ($enrols) {
+            $enrol = reset($enrols);
+            if (!empty($enrol->timestart)) {
+                return $this->smart_date_format_public($enrol->timestart, $format);
             }
         }
-        return null;
+        
+        // 2. TENTATIVA SECUNDÁRIA: Tabela de Atribuição de Papéis (Para Admins/Professores Manuais)
+        // Se você deu o cargo de "Professor" direto, está aqui.
+        $context = \context_course::instance($courseid);
+        $sql_role = "SELECT timemodified FROM {role_assignments} 
+                     WHERE contextid = :contextid AND userid = :userid 
+                     ORDER BY timemodified ASC";
+        $roles = $DB->get_records_sql($sql_role, ['contextid' => $context->id, 'userid' => $userid], 0, 1);
+        
+        if ($roles) {
+            $role = reset($roles);
+            return $this->smart_date_format_public($role->timemodified, $format);
+        }
+
+        // 3. TENTATIVA FINAL: Logs (Primeiro acesso ao curso)
+        // Útil se o usuário é Admin Global e não tem papel atribuído no curso, apenas acessou.
+        if ($DB->get_manager()->table_exists('logstore_standard_log')) {
+             $sql_log = "SELECT timecreated FROM {logstore_standard_log} 
+                         WHERE courseid = :courseid AND userid = :userid 
+                         ORDER BY timecreated ASC";
+             $logs = $DB->get_records_sql($sql_log, ['courseid' => $courseid, 'userid' => $userid], 0, 1);
+             if ($logs) {
+                 $log = reset($logs);
+                 return $this->smart_date_format_public($log->timecreated, $format);
+             }
+        }
+        
+        return ''; // Se falhar tudo, retorna vazio
     }
 
-    public function replace_text($texto, $user, $context = [])
-    {
-        $replacer = function ($matches) use ($context, $user) {
-            list($full, $table, $field, $fallback) = $matches + [null, null, null, ''];
-            $value = '';
+    protected function get_user_role($courseid, $userid) {
+        $context = \context_course::instance($courseid);
+        $roles = get_user_roles($context, $userid);
+        $role_names = [];
+        foreach ($roles as $role) {
+            $role_names[] = role_get_name($role, $context);
+        }
+        return implode(', ', $role_names);
+    }
 
-            // Recupera o courseid e dados do curso.
-            $courseid = \mod_customcert\element_helper::get_courseid($this->id);
+    protected function smart_date_format($timestamp, $format) {
+        if (empty($timestamp)) return '';
+        if (empty($format)) return userdate($timestamp, get_string('strftimedate', 'langconfig'));
+        if (strpos($format, '%') !== false) {
+            return userdate($timestamp, $format);
+        }
+        return date($format, $timestamp);
+    }
+
+    protected function process_content($texto, $user, $is_preview) {
+        if (empty($texto) || !is_string($texto)) return $texto;
+
+        // --- MODO PREVIEW ---
+        if ($is_preview) {
+            $dummies = [
+                '{date}' => date('d/m/Y'),
+                '{studentname}' => 'Aluno Teste',
+                '{userid}' => '999',
+                '{course:id}' => '10',
+                '{code}' => 'PREVIEW-CODE'
+            ];
+            $texto = str_replace(array_keys($dummies), array_values($dummies), $texto);
+            return preg_replace('/\{[a-zA-Z0-9_]+:[^}]+\}/', '[DADO]', $texto);
+        }
+
+        // --- MODO REAL ---
+        try {
+            global $DB, $COURSE;
+            $user = $this->load_user_profile($user);
+            
+            $courseid = 0;
+            $issue = new \stdClass();
+            $issue->timecreated = time(); 
+            $issue->code = 'PENDING';
+
+            if ($this->get_id()) {
+                $courseid = \mod_customcert\element_helper::get_courseid($this->get_id());
+                $record = $DB->get_record_sql("SELECT ci.timecreated, ci.code FROM {customcert_issues} ci JOIN {customcert_elements} e ON e.pageid = (SELECT pageid FROM {customcert_elements} WHERE id = :elemid) WHERE e.id = :elementid AND ci.userid = :userid", ['elemid' => $this->get_id(), 'elementid' => $this->get_id(), 'userid' => $user->id], IGNORE_MISSING);
+                if ($record) $issue = $record;
+            }
+            
+            if (empty($courseid) && isset($COURSE->id)) {
+                $courseid = $COURSE->id;
+            }
             $course = get_course($courseid);
-            $customcourse = new \core_course_list_element($course);
-            $customcourse = $customcourse->get_custom_fields();
 
-            // Apenas para depuração — REMOVA depois.
-            // error_log("Table: $table | Field: $field");
+            $that = $this;
+            $pattern = '/\{([a-zA-Z0-9_]+)(?::([a-zA-Z0-9_\s\/\-\.,%\\\\:]+))?(?:\|([^}]*))?\}/';
 
-            switch ($table) {
-                case 'user':
-                    // Gera array com os campos customizados de perfil do usuário baseando no $user->id e retorna um array $user->profile
-                    if (!empty($user->id)) {
-                        global $CFG;
-                        if (!function_exists('profile_load_data')) {
-                            require_once($CFG->dirroot . '/user/profile/lib.php');
-                        }
-                        // profile_load_data aceita o usuário por referência e popula $user->profile
-                        profile_load_data($user);
-                    }
+            $replacer = function ($matches) use ($user, $issue, $course, $that) {
+                $key = strtoupper($matches[1] ?? ''); 
+                $modifier = $matches[2] ?? null;
+                $fallback = $matches[3] ?? '';
+                $val = '';
 
-                    $value = $user->$field ?? ($this->get_user_field_value($user, $field) ?? '');
+                switch ($key) {
+                    case 'USERID':
+                    case 'ID':
+                        return $user->id;
 
+                    case 'DATE':
+                    case 'ISSUEDATE':
+                        return $that->smart_date_format_public((int)$issue->timecreated, $modifier);
+                    case 'CODE':
+                    case 'CERTIFICATECODE':
+                    case 'CERTCODE':
+                        return $issue->code;
+                    case 'URL': 
+                    case 'CERTURL':
+                         return new \moodle_url('/mod/customcert/verify_certificate.php', ['code' => $issue->code]);
 
-                    break;
+                    case 'COURSEID': 
+                        return $course->id;
+                    case 'COURSENAME':
+                    case 'COURSE':
+                        if ($modifier === 'id') return $course->id; 
+                        return $course->fullname;
+                    case 'TEACHERS':
+                        return $that->get_teachers_public($course->id);
+                    case 'GRADE': 
+                        return $that->get_course_grade_public($course->id, $user->id);
+                    case 'HOURS':
+                         if (class_exists('\core_customfield\handler')) {
+                            $h = \core_customfield\handler::get_handler('core_course', 'course');
+                            $d = $h->export_instance_data_object($course->id);
+                            if (isset($d->hours)) return $d->hours;
+                            if (isset($d->cargahoraria)) return $d->cargahoraria;
+                         }
+                         return '';
 
-                case 'course':
-                    $value = $course->$field ?? ($this->get_customcoursefield_value($customcourse, $field) ?? '');
-                    break;
+                    case 'USERNAME': return $user->username;
+                    case 'IDNUMBER': return $user->idnumber;
+                    case 'FIRSTNAME': return $user->firstname;
+                    case 'LASTNAME': return $user->lastname;
+                    case 'EMAIL': return $user->email;
+                    case 'PHONE1': return $user->phone1;
+                    case 'PHONE2': return $user->phone2;
+                    case 'INSTITUTION': return $user->institution;
+                    case 'DEPARTMENT': return $user->department;
+                    case 'ADDRESS': return $user->address;
+                    case 'CITY': return $user->city;
+                    case 'COUNTRY': 
+                        return get_string($user->country, 'countries');
+                    case 'TIMESTART': 
+                        return $that->get_enrollment_date_public($course->id, $user->id, $modifier);
+                    case 'USERROLENAME':
+                        return $that->get_user_role_public($course->id, $user->id);
+                    case 'STUDENTNAME':
+                    case 'USER': 
+                        $k = strtolower($key);
+                        $f = strtolower($modifier ?: $k);
+                        if ($f === 'fullname' || $key === 'STUDENTNAME') return fullname($user);
+                        if (isset($user->$f)) return $user->$f;
+                        if (isset($user->profile[$f])) return $user->profile[$f];
+                        if (isset($user->{"profile_field_".$f})) return $user->{"profile_field_".$f};
+                        break;
+                }
 
-                default:
-                    // Se o contexto tiver essa tabela, tenta pegar direto.
-                    if (isset($context[$table]) && is_object($context[$table])) {
-                        $obj = $context[$table];
-                        $value = $obj->$field ?? '';
-                    }
-                    break;
-            }
+                if ($val !== '' && $val !== null) return $val;
+                
+                $lowerKey = strtolower($key);
+                if (isset($user->$lowerKey)) return $user->$lowerKey;
+                if (isset($user->profile[$lowerKey])) return $user->profile[$lowerKey];
 
-            return ($value !== '') ? $value : $fallback;
-        };
+                if ($fallback !== '') return $fallback;
+                return $matches[0];
+            };
 
-        // Regex: {tabela:campo|fallback}
-        $pattern = '/\{([a-zA-Z0-9_]+):([a-zA-Z0-9_]+)(?:\|([^}]*))?\}/';
+            return preg_replace_callback($pattern, $replacer, $texto);
 
-        return preg_replace_callback($pattern, $replacer, $texto);
+        } catch (\Throwable $e) { return "Erro: " . $e->getMessage(); }
     }
 
-
-    /**
-     * Handles rendering the element on the pdf.
-     *
-     * @param \pdf $pdf the pdf object
-     * @param bool $preview true if it is a preview, false otherwise
-     * @param \stdClass $user the user we are rendering this for
-     */
-    public function render($pdf, $preview, $user)
-    {
-
-        \mod_customcert\element_helper::render_content($pdf, $this, $this->replace_text($this->get_text(), $user));
-    }
-
-    /**
-     * Render the element in html.
-     *
-     * This function is used to render the element when we are using the
-     * drag and drop interface to position it.
-     *
-     * @return string the html
-     */
-    public function render_html()
-    {
+    public function render_html() {
         global $USER;
-
-
-        return \mod_customcert\element_helper::render_html_content($this, $this->replace_text($this->get_text(), $USER));
+        try {
+            $raw = (string)$this->get_data();
+            $content = $this->process_content_public($raw, $USER, true); 
+            return \mod_customcert\element_helper::render_html_content($this, $content);
+        } catch (\Throwable $e) { return "Erro Visual"; }
     }
 
-    /**
-     * Sets the data on the form when editing an element.
-     *
-     * @param \MoodleQuickForm $mform the edit_form instance
-     */
-    public function definition_after_data($mform)
-    {
-        if (!empty($this->get_data())) {
-            $element = $mform->getElement('text');
-            $element->setValue($this->get_data());
+    public function render($pdf, $preview, $user) {
+        try {
+            $raw = (string)$this->get_data();
+            $content = $this->process_content_public($raw, $user, false);
+            \mod_customcert\element_helper::render_content($pdf, $this, $content);
+        } catch (\Throwable $e) { \mod_customcert\element_helper::render_content($pdf, $this, "Erro PDF"); }
+    }
+
+    public function definition_after_data($mform) {
+        if ($data = $this->get_data()) {
+            $mform->getElement('text')->setValue($data);
         }
         parent::definition_after_data($mform);
     }
-
-    /**
-     * Helper function that returns the text.
-     *
-     * @return string
-     */
+    
+    public function smart_date_format_public($t, $f) { return $this->smart_date_format($t, $f); }
+    public function process_content_public($t, $u, $p) { return $this->process_content($t, $u, $p); }
+    public function get_teachers_public($c) { return $this->get_teachers($c); }
+    public function get_course_grade_public($c, $u) { return $this->get_course_grade($c, $u); }
+    public function get_enrollment_date_public($c, $u, $f) { return $this->get_enrollment_date($c, $u, $f); }
+    public function get_user_role_public($c, $u) { return $this->get_user_role($c, $u); }
+}
     protected function get_text(): string
     {
         $context = \mod_customcert\element_helper::get_context($this->get_id());
